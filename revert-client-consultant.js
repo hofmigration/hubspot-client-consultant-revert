@@ -192,9 +192,11 @@ async function applyReverts(toFix) {
 }
 
 function writeCsv(plan) {
+  const order = { REVERT_TO_BLANK: 0, REVERT_TO_NAME: 1, NEEDS_MANUAL: 2, SKIP_HUMAN_EDITED: 3, SKIP_ALREADY_CORRECT: 4, SKIP_NO_WORKFLOW: 5 };
+  const sorted = [...plan].sort((a, b) => (order[a.action] ?? 9) - (order[b.action] ?? 9));
   const header = ["deal_id","deal_name","action","current_value_now","current_source","current_change_time",
     "will_be_set_to","restore_value_source","restore_value_time","reason","result","deal_url"];
-  const rows = plan.map((d) => [
+  const rows = sorted.map((d) => [
     d.id, d.name, d.action, d.currentLabel, d.currentSource, d.currentTime,
     d.action.startsWith("REVERT") ? d.restoreLabel : "(no change)",
     d.action.startsWith("REVERT") ? d.restoreSource : "",
@@ -225,6 +227,7 @@ function summarize(plan, counts, wfByDay, firstByDay, writeStats) {
   if (writeStats) L.push("", `- **Written this run: ${writeStats.ok}** (failed: ${writeStats.fail})`);
   const text = L.join("\n");
   console.log("\n" + text + "\n");
+  fs.writeFileSync("summary.txt", text);
   if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, text + "\n");
 }
 
