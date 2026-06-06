@@ -22,9 +22,9 @@ on:
           - "no"
           - "yes"
       workflow_start_iso:
-        description: "Start of the bad-workflow window (UTC). 08:00Z = 1pm PKT."
+        description: "Cutoff (UTC). Revert workflow writes AFTER this. 07:00Z = 12pm PKT."
         required: false
-        default: "2026-06-06T08:00:00Z"
+        default: "2026-06-06T07:00:00Z"
 
 jobs:
   revert:
