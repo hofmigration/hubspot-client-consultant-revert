@@ -1,0 +1,12 @@
+{
+  "name": "hubspot-client-consultant-revert",
+  "version": "1.0.0",
+  "description": "One-off agent to revert the client_consultant deal property to its pre-workflow values",
+  "main": "revert-client-consultant.js",
+  "scripts": {
+    "start": "node revert-client-consultant.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
