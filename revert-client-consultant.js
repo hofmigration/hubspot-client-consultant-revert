@@ -37,7 +37,7 @@ const BASE = "https://api.hubapi.com";
 const cutoffMs = Date.parse(CUTOFF_ISO);
 
 if (!TOKEN) { console.error("ERROR: HUBSPOT_TOKEN secret is missing."); process.exit(1); }
-if (!["dry_run", "test", "full"].includes(MODE)) { console.error(`ERROR: bad MODE "${MODE}".`); process.exit(1); }
+if (!["dry_run", "test", "full", "diagnose"].includes(MODE)) { console.error(`ERROR: bad MODE "${MODE}".`); process.exit(1); }
 if (!["first_touch", "after_cutoff"].includes(SCOPE)) { console.error(`ERROR: bad SCOPE "${SCOPE}".`); process.exit(1); }
 if (MODE === "full" && REVIEWED !== "yes") {
   console.error('SAFETY STOP: MODE=full needs "reviewed" = "yes". Run dry_run, check the CSV, then come back.');
@@ -229,11 +229,59 @@ function summarize(plan, counts, wfByDay, firstByDay, writeStats) {
   if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, text + "\n");
 }
 
+// A few sample deals to inspect by default (mix of June 2/4 stamped + June 6 / human edited).
+const DEFAULT_DIAG_IDS = ["45941926666", "60902004358", "39110421316", "60918600260", "58474796362"];
+
+async function fetchHistorySingle(id) {
+  return api("GET", `/crm/v3/objects/deals/${id}?propertiesWithHistory=${PROP}&properties=dealname`);
+}
+async function fetchHistoryBatch(ids) {
+  return api("POST", "/crm/v3/objects/deals/batch/read", { propertiesWithHistory: [PROP], inputs: ids.map((id) => ({ id })) });
+}
+
+// DIAGNOSTIC: dump the FULL change log for a few deals, single-GET vs bulk, so we can SEE
+// whether the bulk call is dropping older versions (which would make every revert unsafe).
+async function diagnose(owners) {
+  const raw = (process.env.DIAGNOSE_IDS || "").split(/[,\s]+/).map((s) => s.trim()).filter(Boolean);
+  const ids = raw.length ? raw : DEFAULT_DIAG_IDS;
+  const L = [];
+  L.push(`# History diagnostic — ${ids.length} deals`, "");
+
+  let batchMap = {};
+  try {
+    const b = await fetchHistoryBatch(ids);
+    for (const r of b.results || []) batchMap[String(r.id)] = ((r.propertiesWithHistory && r.propertiesWithHistory[PROP]) || []);
+  } catch (e) { L.push("bulk batch-read error: " + e.message, ""); }
+
+  for (const id of ids) {
+    L.push(`## Deal ${id}`);
+    let single = [];
+    try {
+      const s = await fetchHistorySingle(id);
+      single = (s.propertiesWithHistory && s.propertiesWithHistory[PROP]) || [];
+      L.push(`name: ${s.properties?.dealname || ""}`);
+    } catch (e) { L.push("single-GET error: " + e.message); }
+    const batchN = (batchMap[String(id)] || []).length;
+    L.push(`>> single-GET returned ${single.length} versions  |  bulk batch-read returned ${batchN} versions`);
+    if (single.length > batchN) L.push(">> MISMATCH: the bulk call is dropping history. This is the bug.");
+    L.push("Full change log (single-GET, newest first):");
+    single.map((v) => ({ ...v, ts: Date.parse(v.timestamp) })).sort((a, b) => b.ts - a.ts)
+      .forEach((v, i) => L.push(`  ${i}: [${v.sourceType}] ${new Date(v.ts).toISOString()}  value="${norm(v.value)}"  -> ${label(v.value, owners)}`));
+    L.push("");
+    await sleep(200);
+  }
+  const text = L.join("\n");
+  console.log("\n" + text + "\n");
+  fs.writeFileSync("summary.txt", text);
+  if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, text + "\n");
+}
+
 (async () => {
   console.log(`MODE=${MODE}  SCOPE=${SCOPE}`);
   if (SCOPE === "after_cutoff") console.log(`Cutoff = ${CUTOFF_ISO}`);
   console.log("Loading owner names...");
   const owners = await loadOwners();
+  if (MODE === "diagnose") { await diagnose(owners); console.log("Wrote summary.txt"); return; }
   console.log("Listing every deal in the portal (the quick part)...");
   const { ids, names, total } = await enumerateAllDeals();
   console.log(`  ${ids.length} deals to inspect.`);
