@@ -87,24 +87,22 @@ function label(v, owners) {
   return owners[norm(v)] || `user ${norm(v)}`;
 }
 
-// Scan ALL deals that currently have the field set (no date filter, so we catch June 2 damage too)
-async function findCandidates() {
-  const ids = []; const names = {}; let after = null; let total = null;
+// Enumerate EVERY deal in the portal via the list endpoint (no 10,000 cap, unlike search).
+// We must check every deal because the contact-side workflows wrote client_consultant onto
+// associated deals all across the CRM, so no date/value filter is safe.
+async function enumerateAllDeals() {
+  const ids = []; const names = {}; let after = null; let pages = 0;
   do {
-    const body = {
-      filterGroups: [{ filters: [{ propertyName: PROP, operator: "HAS_PROPERTY" }] }],
-      properties: ["dealname"], limit: 200,
-      sorts: [{ propertyName: "hs_lastmodifieddate", direction: "DESCENDING" }],
-    };
-    if (after) body.after = after;
-    const d = await api("POST", "/crm/v3/objects/deals/search", body);
-    if (total === null) total = d.total;
+    const q = after ? `&after=${after}` : "";
+    const d = await api("GET", `/crm/v3/objects/deals?limit=100&properties=dealname${q}`);
     for (const r of d.results || []) { ids.push(r.id); names[r.id] = r.properties?.dealname || ""; }
     after = d.paging?.next?.after || null;
+    pages++;
+    if (pages % 25 === 0) process.stdout.write(`\r  listing deals: ${ids.length}`);
     await sleep(120);
-  } while (after && ids.length < 10000);
-  if (total > 10000) console.log(`  WARNING: ${total} deals have the field but search caps at 10,000. Tell me.`);
-  return { ids, names, total };
+  } while (after);
+  process.stdout.write(`\r  listing deals: ${ids.length}\n`);
+  return { ids, names, total: ids.length };
 }
 
 async function buildPlan(ids, dealNames, owners) {
@@ -236,10 +234,10 @@ function summarize(plan, counts, wfByDay, firstByDay, writeStats) {
   if (SCOPE === "after_cutoff") console.log(`Cutoff = ${CUTOFF_ISO}`);
   console.log("Loading owner names...");
   const owners = await loadOwners();
-  console.log("Finding all deals with the field set...");
-  const { ids, names, total } = await findCandidates();
-  console.log(`  ${ids.length} deals to inspect (search total: ${total}).`);
-  console.log("Reading change history...");
+  console.log("Listing every deal in the portal (the quick part)...");
+  const { ids, names, total } = await enumerateAllDeals();
+  console.log(`  ${ids.length} deals to inspect.`);
+  console.log("Reading change history for every deal (this is the slow part, 20-40 min)...");
   const { plan, wfChangesByDay, firstTouchByDay } = await buildPlan(ids, names, owners);
 
   const counts = {};
