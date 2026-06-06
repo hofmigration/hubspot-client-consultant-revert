@@ -11,8 +11,13 @@ on:
         type: choice
         options:
           - dry_run   # writes nothing, just builds the plan + CSV
+          - diagnose  # dumps full history for a few deals (read-only check)
           - test      # actually writes the first 10 deals
           - full      # writes everything
+      diagnose_ids:
+        description: "For diagnose mode: deal IDs to inspect, comma-separated. Leave blank to use samples."
+        required: false
+        default: ""
       reviewed:
         description: "I reviewed the dry-run CSV (required for full)"
         required: true
@@ -53,6 +58,7 @@ jobs:
           REVIEWED: ${{ inputs.reviewed }}
           SCOPE: ${{ inputs.scope }}
           WORKFLOW_START_ISO: ${{ inputs.workflow_start_iso }}
+          DIAGNOSE_IDS: ${{ inputs.diagnose_ids }}
         run: node revert-client-consultant.js
 
       - name: Upload the plan (downloadable)
