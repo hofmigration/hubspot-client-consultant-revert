@@ -1,0 +1,54 @@
+name: Revert Client Consultant
+
+# Manual only - you press "Run workflow" and pick the mode.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "What to do"
+        required: true
+        default: "dry_run"
+        type: choice
+        options:
+          - dry_run   # writes nothing, just builds the plan + CSV
+          - test      # actually writes the first 10 deals
+          - full      # writes everything
+      reviewed:
+        description: "I reviewed the dry-run CSV (required for full)"
+        required: true
+        default: "no"
+        type: choice
+        options:
+          - "no"
+          - "yes"
+      workflow_start_iso:
+        description: "Start of the bad-workflow window (UTC). 08:00Z = 1pm PKT."
+        required: false
+        default: "2026-06-06T08:00:00Z"
+
+jobs:
+  revert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run revert agent
+        env:
+          HUBSPOT_TOKEN: ${{ secrets.HUBSPOT_TOKEN }}
+          MODE: ${{ inputs.mode }}
+          REVIEWED: ${{ inputs.reviewed }}
+          WORKFLOW_START_ISO: ${{ inputs.workflow_start_iso }}
+        run: node revert-client-consultant.js
+
+      - name: Upload the plan (downloadable CSV)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: revert-plan
+          path: revert-plan.csv
