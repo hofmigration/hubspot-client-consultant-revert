@@ -1,77 +1,69 @@
 /**
- * Client Consultant Revert Agent  (v2)
+ * Client Consultant Revert Agent  (v3)
  * ------------------------------------
- * Undoes the "Sync Client Consultant from Contact Owner to Deals" workflow.
+ * Undoes the "Sync Client Consultant from Contact Owner to Deals" workflow,
+ * which re-fired across June 2 / 4 / 6 and stamped wrong owners into the field.
  *
- * WHAT IT DOES (per your instructions):
- *   - Cutoff = 12:00 PM PKT on June 6 (= 07:00 UTC). "After 12pm."
- *   - For any deal where the WORKFLOW wrote to client_consultant AFTER the cutoff,
- *     restore the value that was there JUST BEFORE the cutoff
- *     (blank -> blank, as in the example deal; name -> that name).
+ * SCOPE (env SCOPE):
+ *   first_touch (default, RECOMMENDED):
+ *       For each deal, find the FIRST time the workflow ever wrote this field,
+ *       and restore whatever was there immediately before that.
+ *       (Your example deal -> blank, because nothing was there before.)
+ *   after_cutoff:
+ *       Only revert deals the workflow wrote AFTER the WORKFLOW_START_ISO time.
  *
- * SAFETY GUARDS:
- *   - If a PERSON (CRM_UI) made the last change, leave the deal alone
- *     (you've already handled it by hand).
- *   - If the value we'd need to restore was set by a person, the API returns
- *     unreadable junk -> we DO NOT write; we flag it NEEDS_MANUAL.
+ * SAFETY GUARDS (both scopes):
+ *   - If a PERSON (CRM_UI) made the LAST change, leave the deal alone.
+ *   - If the value we'd restore was set by a person, the API returns unreadable
+ *     junk -> we DO NOT write; flag it NEEDS_MANUAL.
  *   - Modes: dry_run (no writes), test (first 10), full (everything).
+ *
+ * Always prints a day-by-day timeline of workflow changes so you can SEE the damage.
  */
 
 const fs = require("fs");
 
-// ---------- Config ----------
 const TOKEN = process.env.HUBSPOT_TOKEN;
 const MODE = (process.env.MODE || "dry_run").toLowerCase();
 const REVIEWED = (process.env.REVIEWED || "no").toLowerCase();
-// 12:00 PM Pakistan time, June 6 = 07:00 UTC.
-const CUTOFF_ISO = process.env.WORKFLOW_START_ISO || "2026-06-06T07:00:00Z";
-const WORKFLOW_SOURCE_TYPES = ["AUTOMATION_PLATFORM"]; // your workflow shows up as this
+const SCOPE = (process.env.SCOPE || "first_touch").toLowerCase();
+const CUTOFF_ISO = process.env.WORKFLOW_START_ISO || "2026-06-06T07:00:00Z"; // only used by after_cutoff
+const WORKFLOW_SOURCE_TYPES = ["AUTOMATION_PLATFORM"];
 const PROP = "client_consultant";
 const TEST_LIMIT = 10;
-// When a person set the value, the API hands back this description text instead
-// of the real value. We treat anything containing this as UNREADABLE.
 const UNREADABLE_HINT = "stores an actual user";
 
 const BASE = "https://api.hubapi.com";
 const cutoffMs = Date.parse(CUTOFF_ISO);
 
 if (!TOKEN) { console.error("ERROR: HUBSPOT_TOKEN secret is missing."); process.exit(1); }
-if (!["dry_run", "test", "full"].includes(MODE)) {
-  console.error(`ERROR: MODE must be dry_run, test, or full (got "${MODE}").`); process.exit(1);
-}
+if (!["dry_run", "test", "full"].includes(MODE)) { console.error(`ERROR: bad MODE "${MODE}".`); process.exit(1); }
+if (!["first_touch", "after_cutoff"].includes(SCOPE)) { console.error(`ERROR: bad SCOPE "${SCOPE}".`); process.exit(1); }
 if (MODE === "full" && REVIEWED !== "yes") {
-  console.error('SAFETY STOP: MODE=full needs the "reviewed" input set to "yes". Run dry_run, check the CSV, then come back.');
+  console.error('SAFETY STOP: MODE=full needs "reviewed" = "yes". Run dry_run, check the CSV, then come back.');
   process.exit(1);
 }
 
-// ---------- Helpers ----------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 async function api(method, path, body, attempt = 1) {
   const res = await fetch(BASE + path, {
-    method,
-    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    method, headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
     body: body ? JSON.stringify(body) : undefined,
   });
   if ((res.status === 429 || res.status >= 500) && attempt <= 6) {
     const wait = Math.min(1000 * 2 ** (attempt - 1), 15000);
-    console.log(`  (status ${res.status}, retrying in ${wait}ms...)`);
-    await sleep(wait);
+    console.log(`  (status ${res.status}, retry in ${wait}ms)`); await sleep(wait);
     return api(method, path, body, attempt + 1);
   }
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`${method} ${path} -> ${res.status}: ${text.slice(0, 400)}`);
-  }
+  if (!res.ok) throw new Error(`${method} ${path} -> ${res.status}: ${(await res.text()).slice(0, 400)}`);
   return res.json();
 }
-
 const norm = (v) => (v === null || v === undefined ? "" : String(v).trim());
 const blank = (v) => norm(v) === "";
 const isUnreadable = (v) => norm(v).toLowerCase().includes(UNREADABLE_HINT);
-const isWorkflow = (st) => WORKFLOW_SOURCE_TYPES.includes(st);
-
-function chunk(arr, n) { const o = []; for (let i = 0; i < arr.length; i += n) o.push(arr.slice(i, i + n)); return o; }
+const isWf = (st) => WORKFLOW_SOURCE_TYPES.includes(st);
+const day = (ts) => new Date(ts).toISOString().slice(0, 10);
+function chunk(a, n) { const o = []; for (let i = 0; i < a.length; i += n) o.push(a.slice(i, i + n)); return o; }
 function csvCell(s) { const v = s == null ? "" : String(s); return `"${v.replace(/"/g, '""')}"`; }
 
 async function loadOwners() {
@@ -79,14 +71,14 @@ async function loadOwners() {
   try {
     do {
       const q = after ? `&after=${after}` : "";
-      const data = await api("GET", `/crm/v3/owners?limit=100${q}`);
-      for (const o of data.results || []) {
-        const name = [o.firstName, o.lastName].filter(Boolean).join(" ").trim();
-        map[String(o.id)] = name ? `${name} (${o.email || ""})` : (o.email || String(o.id));
+      const d = await api("GET", `/crm/v3/owners?limit=100${q}`);
+      for (const o of d.results || []) {
+        const n = [o.firstName, o.lastName].filter(Boolean).join(" ").trim();
+        map[String(o.id)] = n ? `${n} (${o.email || ""})` : (o.email || String(o.id));
       }
-      after = data.paging?.next?.after || null;
+      after = d.paging?.next?.after || null;
     } while (after);
-  } catch (e) { console.log("  (could not load owner names, will show raw IDs)"); }
+  } catch (e) { console.log("  (owner names unavailable, showing IDs)"); }
   return map;
 }
 function label(v, owners) {
@@ -95,77 +87,83 @@ function label(v, owners) {
   return owners[norm(v)] || `user ${norm(v)}`;
 }
 
+// Scan ALL deals that currently have the field set (no date filter, so we catch June 2 damage too)
 async function findCandidates() {
   const ids = []; const names = {}; let after = null; let total = null;
   do {
     const body = {
-      filterGroups: [{ filters: [
-        { propertyName: PROP, operator: "HAS_PROPERTY" },
-        { propertyName: "hs_lastmodifieddate", operator: "GTE", value: String(cutoffMs) },
-      ]}],
-      properties: ["dealname"],
-      limit: 200,
+      filterGroups: [{ filters: [{ propertyName: PROP, operator: "HAS_PROPERTY" }] }],
+      properties: ["dealname"], limit: 200,
       sorts: [{ propertyName: "hs_lastmodifieddate", direction: "DESCENDING" }],
     };
     if (after) body.after = after;
-    const data = await api("POST", "/crm/v3/objects/deals/search", body);
-    if (total === null) total = data.total;
-    for (const r of data.results || []) { ids.push(r.id); names[r.id] = r.properties?.dealname || ""; }
-    after = data.paging?.next?.after || null;
-    await sleep(150);
+    const d = await api("POST", "/crm/v3/objects/deals/search", body);
+    if (total === null) total = d.total;
+    for (const r of d.results || []) { ids.push(r.id); names[r.id] = r.properties?.dealname || ""; }
+    after = d.paging?.next?.after || null;
+    await sleep(120);
   } while (after && ids.length < 10000);
-  if (total > 10000) console.log(`  WARNING: ${total} match but search caps at 10,000. Tell me if it's really this many.`);
+  if (total > 10000) console.log(`  WARNING: ${total} deals have the field but search caps at 10,000. Tell me.`);
   return { ids, names, total };
 }
 
 async function buildPlan(ids, dealNames, owners) {
-  const plan = []; const batches = chunk(ids, 50); let done = 0;
+  const plan = [];
+  const wfChangesByDay = {};   // every workflow write, by day
+  const firstTouchByDay = {};  // each deal's FIRST workflow write, by day
+  const batches = chunk(ids, 50); let done = 0;
+
   for (const batch of batches) {
-    const data = await api("POST", "/crm/v3/objects/deals/batch/read", {
-      propertiesWithHistory: [PROP],
-      inputs: batch.map((id) => ({ id })),
+    const d = await api("POST", "/crm/v3/objects/deals/batch/read", {
+      propertiesWithHistory: [PROP], inputs: batch.map((id) => ({ id })),
     });
-    for (const r of data.results || []) {
+    for (const r of d.results || []) {
       const id = r.id;
       let versions = ((r.propertiesWithHistory && r.propertiesWithHistory[PROP]) || [])
         .map((v) => ({ ...v, ts: Date.parse(v.timestamp) }))
         .sort((a, b) => b.ts - a.ts); // newest first
 
       const current = versions[0] || { value: "", sourceType: "NONE", ts: 0 };
-      const priorVersion = versions.find((v) => v.ts < cutoffMs);
-      const restoreValue = priorVersion ? norm(priorVersion.value) : "";
-      const restoreSource = priorVersion ? priorVersion.sourceType : "(none - was blank)";
-      const restoreTime = priorVersion ? new Date(priorVersion.ts).toISOString() : "";
-      const workflowTouchedInWindow = versions.some((v) => v.ts >= cutoffMs && isWorkflow(v.sourceType));
+      const wfVersions = versions.filter((v) => isWf(v.sourceType));
+      wfVersions.forEach((v) => (wfChangesByDay[day(v.ts)] = (wfChangesByDay[day(v.ts)] || 0) + 1));
 
-      let action, reason;
-      if (!workflowTouchedInWindow) {
-        action = "SKIP_NOT_IN_WINDOW";
-        reason = "Workflow did not write to this field after 12pm June 6.";
-      } else if (!isWorkflow(current.sourceType)) {
-        action = "SKIP_HUMAN_EDITED";
-        reason = `Last change was ${current.sourceType} - already handled by a person, leaving alone.`;
-      } else if (isUnreadable(restoreValue)) {
-        action = "NEEDS_MANUAL";
-        reason = "The value to restore was set by a person and can't be read back safely - fix by hand.";
-      } else if (norm(current.value) === restoreValue) {
-        action = "SKIP_ALREADY_CORRECT";
-        reason = "Field already equals its pre-noon value.";
+      let touched, boundaryTs;
+      if (SCOPE === "after_cutoff") {
+        touched = wfVersions.some((v) => v.ts >= cutoffMs); boundaryTs = cutoffMs;
       } else {
-        action = blank(restoreValue) ? "REVERT_TO_BLANK" : "REVERT_TO_NAME";
-        reason = `Workflow changed it after 12pm June 6; restoring value from ${restoreTime || "before the workflow ever touched it (blank)"}.`;
+        touched = wfVersions.length > 0;
+        boundaryTs = wfVersions.length ? Math.min(...wfVersions.map((v) => v.ts)) : null;
+      }
+      if (wfVersions.length) firstTouchByDay[day(Math.min(...wfVersions.map((v) => v.ts)))] =
+        (firstTouchByDay[day(Math.min(...wfVersions.map((v) => v.ts)))] || 0) + 1;
+
+      let action, reason, restoreValue = "", restoreSource = "", restoreTime = "";
+      if (!touched) {
+        action = "SKIP_NO_WORKFLOW"; reason = "Workflow never wrote this field (in scope).";
+      } else {
+        const restoreVersion = versions.find((v) => v.ts < boundaryTs);
+        restoreValue = restoreVersion ? norm(restoreVersion.value) : "";
+        restoreSource = restoreVersion ? restoreVersion.sourceType : "(none - was blank)";
+        restoreTime = restoreVersion ? new Date(restoreVersion.ts).toISOString() : "";
+
+        if (!isWf(current.sourceType)) {
+          action = "SKIP_HUMAN_EDITED"; reason = `Last change was ${current.sourceType} - already handled by a person.`;
+        } else if (isUnreadable(restoreValue)) {
+          action = "NEEDS_MANUAL"; reason = "Pre-workflow value was set by a person and can't be read back safely.";
+        } else if (norm(current.value) === restoreValue) {
+          action = "SKIP_ALREADY_CORRECT"; reason = "Field already equals its pre-workflow value.";
+        } else {
+          action = blank(restoreValue) ? "REVERT_TO_BLANK" : "REVERT_TO_NAME";
+          reason = `Restoring value from ${restoreTime || "before the workflow ever touched it (blank)"}.`;
+        }
       }
 
       plan.push({
         id, name: dealNames[id] || "",
-        currentLabel: label(current.value, owners),
-        currentSource: current.sourceType,
+        currentLabel: label(current.value, owners), currentSource: current.sourceType,
         currentTime: current.ts ? new Date(current.ts).toISOString() : "",
-        restoreValue,
-        restoreLabel: label(restoreValue, owners),
-        restoreSource, restoreTime,
-        action, reason,
-        url: `https://app.hubspot.com/contacts/23735726/record/0-3/${id}`,
+        restoreValue, restoreLabel: label(restoreValue, owners), restoreSource, restoreTime,
+        action, reason, url: `https://app.hubspot.com/contacts/23735726/record/0-3/${id}`,
       });
     }
     done += batch.length;
@@ -173,28 +171,24 @@ async function buildPlan(ids, dealNames, owners) {
     await sleep(200);
   }
   process.stdout.write("\n");
-  return plan;
+  return { plan, wfChangesByDay, firstTouchByDay };
 }
 
 async function applyReverts(toFix) {
   let ok = 0, fail = 0;
-  for (const group of chunk(toFix, 100)) {
+  for (const g of chunk(toFix, 100)) {
     try {
       await api("POST", "/crm/v3/objects/deals/batch/update", {
-        inputs: group.map((d) => ({ id: d.id, properties: { [PROP]: d.restoreValue } })), // "" clears it
+        inputs: g.map((d) => ({ id: d.id, properties: { [PROP]: d.restoreValue } })),
       });
-      group.forEach((d) => (d.result = "WRITTEN"));
-      ok += group.length;
+      g.forEach((d) => (d.result = "WRITTEN")); ok += g.length;
     } catch (e) {
-      group.forEach((d) => (d.result = "ERROR: " + e.message.slice(0, 120)));
-      fail += group.length;
+      g.forEach((d) => (d.result = "ERROR: " + e.message.slice(0, 120))); fail += g.length;
       console.log("  batch write error:", e.message.slice(0, 200));
     }
-    process.stdout.write(`\r  written: ${ok}, failed: ${fail}`);
-    await sleep(300);
+    process.stdout.write(`\r  written: ${ok}, failed: ${fail}`); await sleep(300);
   }
-  process.stdout.write("\n");
-  return { ok, fail };
+  process.stdout.write("\n"); return { ok, fail };
 }
 
 function writeCsv(plan) {
@@ -210,51 +204,51 @@ function writeCsv(plan) {
   fs.writeFileSync("revert-plan.csv", [header.join(","), ...rows].join("\n"));
 }
 
-function summarize(plan, counts, writeStats) {
+function summarize(plan, counts, wfByDay, firstByDay, writeStats) {
   const L = [];
-  L.push(`# Client Consultant Revert — ${MODE.toUpperCase()}`, "");
-  L.push(`- Cutoff (workflow writes AFTER this get reverted): **${CUTOFF_ISO}** = 12:00 PM PKT, June 6`);
-  L.push(`- Candidate deals scanned: **${plan.length}**`);
+  L.push(`# Client Consultant Revert — ${MODE.toUpperCase()} — scope: ${SCOPE}`, "");
+  L.push("### When the workflow actually changed this field");
+  L.push("Each deal's FIRST workflow touch, by day (this is when damage happened):");
+  Object.keys(firstByDay).sort().forEach((k) => L.push(`- ${k}: **${firstByDay[k]}** deals`));
+  L.push("");
+  L.push("All workflow writes, by day (includes re-fires):");
+  Object.keys(wfByDay).sort().forEach((k) => L.push(`- ${k}: ${wfByDay[k]} writes`));
+  L.push("");
+  L.push("### Plan");
+  L.push(`- Deals scanned: **${plan.length}**`);
   L.push(`- Revert to BLANK: **${counts.REVERT_TO_BLANK || 0}**`);
-  L.push(`- Revert to a NAME (review these): **${counts.REVERT_TO_NAME || 0}**`);
-  L.push(`- Needs manual fix (old value unreadable): **${counts.NEEDS_MANUAL || 0}**`);
+  L.push(`- Revert to a NAME (review): **${counts.REVERT_TO_NAME || 0}**`);
+  L.push(`- Needs manual fix (unreadable old value): **${counts.NEEDS_MANUAL || 0}**`);
   L.push(`- Skipped, person edited after: **${counts.SKIP_HUMAN_EDITED || 0}**`);
-  L.push(`- Skipped, not changed in window: **${counts.SKIP_NOT_IN_WINDOW || 0}**`);
   L.push(`- Skipped, already correct: **${counts.SKIP_ALREADY_CORRECT || 0}**`);
-  if (writeStats) L.push("", `- **Actually written this run: ${writeStats.ok}** (failed: ${writeStats.fail})`);
+  L.push(`- Skipped, workflow never touched: **${counts.SKIP_NO_WORKFLOW || 0}**`);
+  if (writeStats) L.push("", `- **Written this run: ${writeStats.ok}** (failed: ${writeStats.fail})`);
   const text = L.join("\n");
   console.log("\n" + text + "\n");
   if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, text + "\n");
 }
 
 (async () => {
-  console.log(`MODE = ${MODE}`);
-  console.log(`Cutoff = ${CUTOFF_ISO} (${cutoffMs})  [revert deals the workflow changed AFTER this]`);
+  console.log(`MODE=${MODE}  SCOPE=${SCOPE}`);
+  if (SCOPE === "after_cutoff") console.log(`Cutoff = ${CUTOFF_ISO}`);
   console.log("Loading owner names...");
   const owners = await loadOwners();
-  console.log("Finding deals modified since the cutoff...");
+  console.log("Finding all deals with the field set...");
   const { ids, names, total } = await findCandidates();
-  console.log(`  found ${ids.length} candidate deals (search total: ${total}).`);
-  console.log("Reading change history for each deal...");
-  const plan = await buildPlan(ids, names, owners);
+  console.log(`  ${ids.length} deals to inspect (search total: ${total}).`);
+  console.log("Reading change history...");
+  const { plan, wfChangesByDay, firstTouchByDay } = await buildPlan(ids, names, owners);
 
   const counts = {};
   plan.forEach((d) => (counts[d.action] = (counts[d.action] || 0) + 1));
 
   let toFix = plan.filter((d) => d.action.startsWith("REVERT"));
   let writeStats = null;
-  if (MODE === "dry_run") {
-    console.log(`\nDRY RUN — nothing written. ${toFix.length} deals would be reverted.`);
-  } else if (MODE === "test") {
-    toFix = toFix.slice(0, TEST_LIMIT);
-    console.log(`\nTEST — writing first ${toFix.length} deals only...`);
-    writeStats = await applyReverts(toFix);
-  } else {
-    console.log(`\nFULL — writing all ${toFix.length} deals...`);
-    writeStats = await applyReverts(toFix);
-  }
+  if (MODE === "dry_run") console.log(`\nDRY RUN — nothing written. ${toFix.length} deals would be reverted.`);
+  else if (MODE === "test") { toFix = toFix.slice(0, TEST_LIMIT); console.log(`\nTEST — writing first ${toFix.length}...`); writeStats = await applyReverts(toFix); }
+  else { console.log(`\nFULL — writing all ${toFix.length}...`); writeStats = await applyReverts(toFix); }
 
   writeCsv(plan);
-  summarize(plan, counts, writeStats);
+  summarize(plan, counts, wfChangesByDay, firstTouchByDay, writeStats);
   console.log("Wrote revert-plan.csv");
 })().catch((e) => { console.error("FATAL:", e.message); process.exit(1); });
